@@ -74,10 +74,6 @@ year_end_filter = pd.to_datetime(end_filter_date).year
 # db = wrds.Connection(wrds_username=wrds_username, verbose = False)
 
 def prep_data(merged_df, top_eod_data):
-    top_eod_data['date'] = pd.to_datetime(top_eod_data['date'])
-    merged_df = pd.read_parquet('../data/merged_data_official.parquet')
-    merged_df_2 = pd.merge(merged_df, top_eod_data[['ticker', 'date', 'adj_open', 'adj_volume']], how='left', on=['ticker', 'date'])
-    merged_df_2.tail()
     merged_df['days_since_announcement'] = (merged_df['date'] - merged_df['anndats']).dt.days
     merged_df['close_after_announcement'] = merged_df.groupby('ticker')['adj_close'].shift(-1)
     merged_df['close_after_announcement'] = merged_df['close_after_announcement'].where(merged_df['days_since_announcement'] == 0, np.nan)
@@ -112,7 +108,7 @@ def prep_data(merged_df, top_eod_data):
     merged_df['day_after_earnings']= merged_df.groupby(['ticker', 'anndats'])['date'].nth(1)
     merged_df['day_after_earnings'] = merged_df.groupby('ticker')['day_after_earnings'].ffill()
     merged_df['previous_day_return'] = merged_df.groupby('ticker')['adj_close'].pct_change()
-    merged_df[merged_df['ticker']=='AAPL'][['date','anndats', 'day_after_earnings']].tail(20)
+    # merged_df[merged_df['ticker']=='AAPL'][['date','anndats', 'day_after_earnings']].tail(20)
 
 
 def gradient_regression_model(final_df, w=20, N=20):
@@ -131,6 +127,8 @@ def gradient_regression_model(final_df, w=20, N=20):
         'net_debt_to_ebitda', 'debt_to_revenue', 'revenue_growth',
         'ebitda_growth', 'mkt_cap_growth', 'log_mkt_cap', 'fcf_growth', 'days_since_announcement', 'return_since_announcement', 'previous_day_return'
     ]
+    final_df[f'target_return_{w}_day'] = final_df.groupby('ticker')['adj_close'].pct_change(w).shift(-w)
+    final_df = final_df.dropna(subset=[f'target_return_{w}_day']).copy()
     validation_set = final_df.loc[final_df['date']>=pd.to_datetime('2024-01-01')].copy()
     in_sample = final_df.loc[final_df['date']<pd.to_datetime('2024-01-01')].copy()
     test_size = int(np.floor(len(in_sample) * 0.1))
@@ -223,6 +221,30 @@ def gradient_regression_model(final_df, w=20, N=20):
 
 
 def gradient_clf_model(final_df, spy_df, w=20, N=20):
+
+    target_col = f'cat_target_return_{w}_day'  # Change this if needed
+    if target_col not in final_df.columns:
+        final_df = final_df.dropna(subset= 'adj_close').copy()
+        final_df[f'target_return_{w}_day'] = final_df.groupby('ticker')['adj_close'].pct_change(w)
+        final_df[f'target_return_{w}_day'] = final_df.groupby('ticker')[f'target_return_{w}_day'].shift(-w)
+        final_df[f'lower_quantile_{w}_day'] = final_df[f'target_return_{w}_day'].expanding().quantile(0.25)
+        final_df[f'upper_quantile_{w}_day'] = final_df[f'target_return_{w}_day'].expanding().quantile(0.75)
+        final_df[f"cat_target_return_{w}_day"] = np.where(
+        (final_df[f'lower_quantile_{w}_day'] > 0) | (final_df[f'upper_quantile_{w}_day'] < 0),
+        0,
+        np.where(
+            final_df[f'target_return_{w}_day'] < final_df[f'lower_quantile_{w}_day'],
+            1,
+            np.where(
+                final_df[f'target_return_{w}_day'] > final_df[f'upper_quantile_{w}_day'],
+                2,
+                0
+            )
+        )
+        )
+    final_df= final_df.loc[(final_df['date']>=data_start_date) & (final_df['date']<=data_end_date)].copy().reset_index(drop=True)
+    final_df = final_df.loc[final_df['date']==final_df['day_after_earnings']].copy()
+
 
     # 1) Split your data into training, test, and validation sets
     validation_set = final_df.loc[final_df['date'] >= pd.to_datetime('2024-01-01')].copy()
