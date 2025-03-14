@@ -798,3 +798,132 @@ def run_backtest(merged_df,
     reg = sm.OLS(returns_hedged, sm.add_constant(ff.loc[ff['date'].isin(returns_hedged.index)].set_index('date'))).fit()
     print(reg.summary())
     return returns_hedged, returns_unhedged
+
+def rf_gridsearch(param_grid_xgb, merged_df):
+
+    # Create a list of parameter combinations using itertools.product
+    param_names = list(param_grid_xgb.keys())
+    param_values = list(param_grid_xgb.values())
+    param_combinations = list(itertools.product(*param_values))
+
+    # Set up a 3-fold stratified cross validation
+    skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+
+    # To store the results for each parameter combination
+    results = []
+    final_df = merged_df.dropna(subset= 'adj_close').copy()
+
+
+
+    for w in param_grid_xgb['holding_period']:
+
+        final_df[f'target_return_{w}_day'] = final_df.groupby('ticker')['adj_close'].pct_change(w)
+        final_df[f'target_return_{w}_day'] = final_df.groupby('ticker')[f'target_return_{w}_day'].shift(-w)
+        final_df[f'lower_quantile_{w}_day'] = final_df[f'target_return_{w}_day'].expanding().quantile(0.25)
+        final_df[f'upper_quantile_{w}_day'] = final_df[f'target_return_{w}_day'].expanding().quantile(0.75)
+        final_df[f"cat_target_return_{w}_day"] = np.where(
+        (final_df[f'lower_quantile_{w}_day'] > 0) | (final_df[f'upper_quantile_{w}_day'] < 0),
+        0,
+        np.where(
+            final_df[f'target_return_{w}_day'] < final_df[f'lower_quantile_{w}_day'],
+            1,
+            np.where(
+                final_df[f'target_return_{w}_day'] > final_df[f'upper_quantile_{w}_day'],
+                2,
+                0
+            )
+        )
+        )
+    final_df= final_df.loc[(final_df['date']>=data_start_date) & (final_df['date']<=data_end_date)].copy().reset_index(drop=True)
+
+    test_set = final_df.loc[(final_df['date'] >= pd.to_datetime('2023-01-01')) & (final_df['date']< '2024-01-01')].copy()
+
+    # 2) Define your columns
+    req_cols = [
+        'ticker',
+        'date',
+        'adj_close'
+    ]
+
+    # 1) Split your data into training, test, and validation sets
+    final_df = final_df.loc[final_df['date']==final_df['day_after_earnings']].copy()
+
+    # Remove duplicate ticker/date rows
+    final_df = final_df.groupby(['ticker', 'date']).first().reset_index()
+    #     validation_set = final_df.loc[final_df['date'] >= pd.to_datetime('2024-01-01')].copy()
+    in_sample = final_df.loc[final_df['date'] < pd.to_datetime('2024-01-01')].copy()
+
+    test_set = in_sample.loc[in_sample['date'] >= pd.to_datetime('2023-01-01')].copy()
+    training_set = in_sample.loc[in_sample['date'] < pd.to_datetime('2023-01-01')].copy()
+
+
+    # 3) Define your features and target for the 5-day classification
+    features = [
+        'suescore', 'cgo', 
+        'mom_21', 'mom_126', 'mom_252', 'short_term_reversal', 
+        'pead_5d', 'pead_20d', 
+        'ps_ratio', 'earnings_yield', 'fcf_yield', 'ebitda_margin', 'roi_scaled',
+        'net_debt_to_ebitda', 'debt_to_revenue', 'revenue_growth',
+        'ebitda_growth', 'mkt_cap_growth', 'log_mkt_cap', 'fcf_growth', 
+        'days_since_announcement', 'return_since_announcement', 'previous_day_return'
+    ]
+
+    X_train = training_set[features]
+        # 4) Scale the features
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+
+    # Loop over every combination in the grid
+    for comb in param_combinations:
+        params = dict(zip(param_names, comb))
+        fold_f1_scores = []
+        y_train = training_set[f'cat_target_return_{params["holding_period"]}_day']
+        # 5) Define sample weights based on class to boost underrepresented classes
+        # For example, if you want to weight classes 1 and 2 higher:
+        # Get the class counts from y_train
+        class_counts = y_train.value_counts()
+        total_samples = len(y_train)
+
+        # Compute class percentages
+        class_percentages = class_counts / total_samples
+
+        # Option A: Use inverse of percentage (may produce large numbers if some classes are very rare)
+        class_weight_map = {cls: 1.0 / perc for cls, perc in class_percentages.items()}
+        sample_weight = y_train.map(class_weight_map).values  # Create an array of weights
+        
+        # Perform CV manually
+        for train_idx, val_idx in skf.split(X_train_scaled, y_train):
+
+            X_tr = X_train_scaled[train_idx]
+            y_tr = y_train.iloc[train_idx]
+            sw_tr = sample_weight[train_idx]
+            X_val = X_train_scaled[val_idx]
+            y_val = y_train.iloc[val_idx]
+            
+            # Initialize the custom XGBoost Random Forest estimator with current parameters
+            model = XGBRFClassifier(
+                max_depth=params['max_depth'],
+                num_parallel_tree=params['num_parallel_tree'],
+                # subsample=params['subsample'],
+                # colsample_bynode=params['colsample_bynode'],
+                tree_method='gpu_hist',  # Change to 'hist' if you're using CPU
+                seed=42
+            )
+            
+            # Fit the model
+            model.fit(X_tr, y_tr, sample_weight=sw_tr)
+            # Predict on the validation fold
+            y_pred = model.predict(X_val)
+            # Compute macro F1 score for this fold
+            fold_f1 = f1_score(y_val, y_pred, average='macro', zero_division=0)
+            fold_f1_scores.append(fold_f1)
+        
+        # Average the score across folds for this parameter combination
+        avg_f1 = np.mean(fold_f1_scores)
+        results.append((params, avg_f1))
+        print("Parameters:", params, "-> Avg Macro F1:", avg_f1)
+
+    # Identify the best parameter combination
+    best_params, best_score = max(results, key=lambda x: x[1])
+    print("\nBest parameters:", best_params)
+    print("Best macro F1 score:", best_score)
