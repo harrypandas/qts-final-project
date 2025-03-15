@@ -157,7 +157,7 @@ def gradient_regression_model(final_df, w=20, N=20):
 
     plt.figure(figsize=(10, 4))
     feature_importance.plot(kind='bar')
-    plt.xticks(rotation=-75) 
+    plt.xticks(rotation=-75, ha='left') 
     plt.title(f"Feature Importance (XGBoost - {w} Day Return)")
     plt.show()
     
@@ -201,10 +201,10 @@ def gradient_regression_model(final_df, w=20, N=20):
 
         # Assuming features is a list of your actual feature names
     xgb_model.get_booster().feature_names = features
-        # Plot the first tree (num_trees=0 for the first tree)
-    xgb.plot_tree(xgb_model, num_trees=0)
-    plt.rcParams['figure.figsize'] = [100, 10]  # Adjust the size if needed
-    plt.show()
+    #     # Plot the first tree (num_trees=0 for the first tree)
+    # xgb.plot_tree(xgb_model, num_trees=0)
+    # plt.rcParams['figure.figsize'] = [100, 10]  # Adjust the size if needed
+    # plt.show()
 
 
     # Print out of sample metrics
@@ -220,15 +220,15 @@ def gradient_regression_model(final_df, w=20, N=20):
     print("Top 10 Important Features:", top_features)
 
 
-def gradient_clf_model(final_df, spy_df, w=20, N=20):
+def gradient_clf_model(final_df, spy_df, w=20, N=20, max_depth=10, n_estimators=10, learning_rate=0.1):
 
     target_col = f'cat_target_return_{w}_day'  # Change this if needed
     if target_col not in final_df.columns:
         final_df = final_df.dropna(subset= 'adj_close').copy()
         final_df[f'target_return_{w}_day'] = final_df.groupby('ticker')['adj_close'].pct_change(w)
         final_df[f'target_return_{w}_day'] = final_df.groupby('ticker')[f'target_return_{w}_day'].shift(-w)
-        final_df[f'lower_quantile_{w}_day'] = final_df[f'target_return_{w}_day'].expanding().quantile(0.25)
-        final_df[f'upper_quantile_{w}_day'] = final_df[f'target_return_{w}_day'].expanding().quantile(0.75)
+        final_df[f'lower_quantile_{w}_day'] = final_df[f'target_return_{w}_day'].quantile(0.25)
+        final_df[f'upper_quantile_{w}_day'] = final_df[f'target_return_{w}_day'].quantile(0.75)
         final_df[f"cat_target_return_{w}_day"] = np.where(
         (final_df[f'lower_quantile_{w}_day'] > 0) | (final_df[f'upper_quantile_{w}_day'] < 0),
         0,
@@ -319,9 +319,9 @@ def gradient_clf_model(final_df, spy_df, w=20, N=20):
     #    If you have three classes (-1, 0, 1), use 'multi:softmax' with num_class=3
     xgb_model = xgb.XGBClassifier(
         tree_method='hist',  # Use 'hist' for faster training
-        n_estimators=10,
-        learning_rate=0.1,
-        max_depth=10,
+        n_estimators=n_estimators,
+        learning_rate=learning_rate,
+        max_depth=max_depth,
         random_state=42,
         objective='multi:softprob',  # multi-class objective
         num_class=3,
@@ -339,7 +339,7 @@ def gradient_clf_model(final_df, spy_df, w=20, N=20):
 
     plt.figure(figsize=(10, 4))
     feature_importance.plot(kind='bar')
-    plt.xticks(rotation=-75)
+    plt.xticks(rotation=-75, ha = 'left')
     plt.title(f"Feature Importance (XGBoost - {w}-Day Classification)")
     plt.show()
 
@@ -382,7 +382,7 @@ def gradient_clf_model(final_df, spy_df, w=20, N=20):
 
     # -- Confusion Matrix
     cm = confusion_matrix(y_test, y_pred)
-    print(f"Confusion Matrix ({w}-Day):\n{cm}")
+    # print(f"Confusion Matrix ({w}-Day):\n{cm}")
 
     # -- Display confusion matrix nicely
     disp = ConfusionMatrixDisplay(confusion_matrix=cm,
@@ -395,15 +395,32 @@ def gradient_clf_model(final_df, spy_df, w=20, N=20):
     report = classification_report(y_test, y_pred, zero_division=0)
     print(f"Classification Report ({w}-Day):\n{report}")
 
-    # 8) Plot distribution of actual vs predicted classes
-    plt.figure(figsize=(10, 4))
-    sns.histplot(y_test, color='blue', alpha=0.5, bins=3, label='Actual', discrete=True)
-    sns.histplot(y_pred, color='red', alpha=0.5, bins=3, label='Predicted', discrete=True)
-    plt.xlabel('Class')
-    plt.ylabel('Count')
-    plt.legend()
-    plt.title(f"Distribution of Actual vs Predicted Classes ({w}-Day)")
+
+    # Convert test array to a DataFrame and ensure it has only your 23 columns
+    X_test_df = pd.DataFrame(X_test_scaled, columns=features)
+    X_test_df = X_test_df[features]            # Make sure we only keep the 23 features
+    X_test_df = X_test_df.reset_index(drop=True)
+
+    explainer = shap.TreeExplainer(xgb_model)
+    shap_values = explainer(X_test_df)         # yields shape (n_samples, n_classes, n_features)
+
+    # Extract SHAP for class=1, shape (n_samples, n_features)
+    shap_values_class1_raw = shap_values[:, :, 1].values
+
+    suescore_idx = features.index("suescore")
+    shap_values_class1_raw
+
+    plt.figure(figsize=(10, 6))
+    shap.dependence_plot(
+        suescore_idx,               # or "suescore"
+        shap_values_class1_raw,     # must be shape (n_samples, 23)
+        X_test_df,                  # must be shape (n_samples, 23)
+        feature_names=features,
+        show=False
+    )
+    plt.title("SHAP Dependence Plot for Large Down Move (SUE Score)")
     plt.show()
+
 
 class XGBRFClassifier(BaseEstimator, ClassifierMixin):
     """
@@ -464,8 +481,8 @@ def run_backtest(merged_df,
     final_df = merged_df.dropna(subset= 'adj_close').copy()
     final_df[f'target_return_{w}_day'] = final_df.groupby('ticker')['adj_close'].pct_change(w)
     final_df[f'target_return_{w}_day'] = final_df.groupby('ticker')[f'target_return_{w}_day'].shift(-w)
-    final_df[f'lower_quantile_{w}_day'] = final_df[f'target_return_{w}_day'].expanding().quantile(0.25)
-    final_df[f'upper_quantile_{w}_day'] = final_df[f'target_return_{w}_day'].expanding().quantile(0.75)
+    final_df[f'lower_quantile_{w}_day'] = final_df[f'target_return_{w}_day'].quantile(0.25)
+    final_df[f'upper_quantile_{w}_day'] = final_df[f'target_return_{w}_day'].quantile(0.75)
     final_df[f"cat_target_return_{w}_day"] = np.where(
     (final_df[f'lower_quantile_{w}_day'] > 0) | (final_df[f'upper_quantile_{w}_day'] < 0),
     0,
